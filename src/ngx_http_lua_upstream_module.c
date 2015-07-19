@@ -34,6 +34,7 @@ static ngx_http_upstream_srv_conf_t *
 static ngx_http_upstream_rr_peer_t *
     ngx_http_lua_upstream_lookup_peer(lua_State *L);
 static int ngx_http_lua_upstream_set_peer_down(lua_State * L);
+static int ngx_http_lua_upstream_add_peer(lua_State * L);
 
 
 static ngx_http_module_t ngx_http_lua_upstream_ctx = {
@@ -97,6 +98,9 @@ ngx_http_lua_upstream_create_module(lua_State * L)
 
     lua_pushcfunction(L, ngx_http_lua_upstream_set_peer_down);
     lua_setfield(L, -2, "set_peer_down");
+
+    lua_pushcfunction(L, ngx_http_lua_upstream_add_peer);
+    lua_setfield(L, -2, "add_peer");
 
     return 1;
 }
@@ -237,6 +241,7 @@ ngx_http_lua_upstream_get_primary_peers(lua_State * L)
     ngx_str_t                             host;
     ngx_uint_t                            i;
     ngx_http_upstream_rr_peers_t         *peers;
+    ngx_http_upstream_rr_peer_t          *peer;
     ngx_http_upstream_srv_conf_t         *us;
 
     if (lua_gettop(L) != 1) {
@@ -262,8 +267,8 @@ ngx_http_lua_upstream_get_primary_peers(lua_State * L)
 
     lua_createtable(L, peers->number, 0);
 
-    for (i = 0; i < peers->number; i++) {
-        ngx_http_lua_get_peer(L, &peers->peer[i], i);
+    for (peer = peers->peer, i = 0; peer; peer = peer->next, i++) {
+        ngx_http_lua_get_peer(L, peer, i);
         lua_rawseti(L, -2, i + 1);
     }
 
@@ -277,6 +282,7 @@ ngx_http_lua_upstream_get_backup_peers(lua_State * L)
     ngx_str_t                             host;
     ngx_uint_t                            i;
     ngx_http_upstream_rr_peers_t         *peers;
+    ngx_http_upstream_rr_peer_t          *peer;
     ngx_http_upstream_srv_conf_t         *us;
 
     if (lua_gettop(L) != 1) {
@@ -308,8 +314,8 @@ ngx_http_lua_upstream_get_backup_peers(lua_State * L)
 
     lua_createtable(L, peers->number, 0);
 
-    for (i = 0; i < peers->number; i++) {
-        ngx_http_lua_get_peer(L, &peers->peer[i], i);
+    for (peer = peers->peer, i = 0; peer; peer = peer->next, i++) {
+        ngx_http_lua_get_peer(L, peer, i);
         lua_rawseti(L, -2, i + 1);
     }
 
@@ -337,14 +343,253 @@ ngx_http_lua_upstream_set_peer_down(lua_State * L)
     return 1;
 }
 
+static int ngx_http_lua_upstream_add_peer(lua_State * L)
+{
+    ngx_http_upstream_rr_peer_t          *peer, *last_pp, **peerp;
+    ngx_http_upstream_srv_conf_t         *uscf;
+    ngx_http_upstream_rr_peers_t         *peers;
+    ngx_http_request_t                   *r;
+    ngx_str_t                             upstream_name, url_addr, host, str_opt;
+    ngx_uint_t                            i, n, k;
+    size_t                                peer_size;
+    ngx_int_t                             weight, max_fails, down, backup;
+    ngx_url_t                             u;
+    time_t                                fail_timeout;
+    int                                   vtype;
+
+    if (lua_gettop(L) != 2) {
+        return luaL_error(L, "exactly two arguments expected");
+    }
+
+    if (!lua_istable(L, -1)) {
+        return luaL_argerror(L, -1, "second argument should be a table");
+    }
+
+    upstream_name.data = (u_char *) luaL_checklstring(L, 1, &upstream_name.len);
+    uscf = ngx_http_lua_upstream_find_upstream(L, &upstream_name);
+
+    if (uscf == NULL) {
+      lua_pushboolean(L, 0);
+      lua_pushliteral(L, "upstream not found");
+      return 2;
+    }
+
+    weight = 1;
+    max_fails = 1;
+    fail_timeout = 10;
+    backup = 0;
+    down = 0;
+
+    if (lua_gettop(L) != 2) {
+        return luaL_error(L, "exactly two arguments expected");
+    }
+
+    r = ngx_http_lua_get_request(L);
+
+    /* url */
+    lua_getfield(L, -1, "url");
+    host.data = (u_char *) luaL_checklstring(L, -1, &host.len);
+    lua_pop(L, 1);
+
+    /* weight */
+    lua_getfield(L, -1, "weight");
+    vtype = lua_type(L, -1);
+    if (LUA_TNUMBER == vtype ||
+        (LUA_TSTRING == vtype && ngx_strlen(luaL_checkstring(L, -1)))) {
+
+        weight = (ngx_int_t) luaL_checkint(L, -1);
+    }
+    lua_pop(L, 1);
+
+    /* backup */
+    lua_getfield(L, -1, "backup");
+    switch (lua_type(L, -1)) {
+    case LUA_TNIL:
+        /* do nothing */
+        break;
+
+    case LUA_TNUMBER:
+        backup = (ngx_int_t) luaL_checkint(L, -1);
+        break;
+    case LUA_TBOOLEAN:
+        backup = (ngx_int_t) lua_toboolean(L, -1);
+        break;
+
+    case LUA_TSTRING:
+        str_opt.data = (u_char *) luaL_checklstring(L, -1, &str_opt.len);
+
+        if (ngx_strlen(str_opt.data)) {
+            backup = (ngx_strncmp(str_opt.data, (u_char *) "true", 4) == 0) ||
+              (ngx_strncmp(str_opt.data, (u_char *) "1", 1) == 0);
+        }
+        break;
+
+    default:
+        return luaL_error(L, "Bad backup option value");
+    }
+    lua_pop(L, 1);
+
+    /* down */
+    lua_getfield(L, -1, "down");
+    switch (lua_type(L, -1)) {
+    case LUA_TNIL:
+        /* do nothing */
+        break;
+
+    case LUA_TNUMBER:
+        down = (ngx_int_t) luaL_checkint(L, -1);
+        break;
+    case LUA_TBOOLEAN:
+        down = (ngx_int_t) lua_toboolean(L, -1);
+        break;
+
+    case LUA_TSTRING:
+        str_opt.data = (u_char *) luaL_checklstring(L, -1, &str_opt.len);
+
+        if (ngx_strlen(str_opt.data)) {
+            down = (ngx_strncmp(str_opt.data, (u_char *) "true", 4) == 0) ||
+              (ngx_strncmp(str_opt.data, (u_char *) "1", 1) == 0);
+        }
+        break;
+
+    default:
+        return luaL_error(L, "Bad down option value");
+    }
+    lua_pop(L, 1);
+    /* ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0, "backup opt: %d", backup); */
+
+    /* max_fails */
+    lua_getfield(L, -1, "max_fails");
+    switch (lua_type(L, -1)) {
+    case LUA_TNIL:
+        /* do nothing */
+        break;
+
+    case LUA_TNUMBER:
+        max_fails = (ngx_int_t) luaL_checkint(L, -1);
+        break;
+
+    case LUA_TSTRING:
+        str_opt.data = (u_char *) luaL_checklstring(L, -1, &str_opt.len);
+
+        if (ngx_strlen(str_opt.data)) {
+            max_fails = (ngx_int_t) lua_tointeger(L, -1);
+        }
+        break;
+
+    default:
+        return luaL_error(L, "Bad max_fails option value");
+    }
+    lua_pop(L, 1);
+
+    /* fail_timeout */
+    lua_getfield(L, -1, "fail_timeout");
+    switch (lua_type(L, -1)) {
+    case LUA_TNIL:
+        /* do nothing */
+        break;
+
+    case LUA_TNUMBER:
+        fail_timeout = (time_t) luaL_checkint(L, -1);
+        break;
+
+    case LUA_TSTRING:
+        str_opt.data = (u_char *) luaL_checklstring(L, -1, &str_opt.len);
+
+        if (ngx_strlen(str_opt.data)) {
+            fail_timeout = (time_t) lua_tointeger(L, -1);
+        }
+        break;
+
+    default:
+        return luaL_error(L, "Bad fail_timeout option value");
+    }
+    lua_pop(L, 1);
+
+    /* parse url */
+    ngx_memzero(&u, sizeof(ngx_url_t));
+    u.url = host;
+    u.default_port = 80;
+
+    if (ngx_parse_url(uscf->servers->pool, &u) != NGX_OK) {
+        if (u.err) {
+            ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0,
+                "%s in upstream \"%V\"", u.err, &u.url);
+        }
+        return luaL_error(L, "Cannot parse url \"%V\"", &u.url);
+    }
+
+
+    peers = uscf->peer.data;
+
+    if (backup) {
+      peers = peers->next;
+    }
+
+    for (peer = peers->peer; peer; peer = peer->next) {
+        for (k = 0; k < u.naddrs; k++) {
+            url_addr = u.addrs[k].name;
+            if (ngx_strncmp(peer->name.data, url_addr.data,
+                  ngx_max(url_addr.len, peer->name.len)) == 0) {
+                lua_pushboolean(L, 0);
+                lua_pushliteral(L, "server already exists");
+                return 2;
+            }
+        }
+    }
+
+
+    for (last_pp = peers->peer; last_pp->next; last_pp = last_pp->next);
+    peerp = &last_pp->next;
+
+    peer_size = sizeof(ngx_http_upstream_rr_peer_t) * u.naddrs;
+
+#if (NGX_HTTP_UPSTREAM_ZONE)
+    if (peers->shpool) {
+        peer = ngx_slab_calloc_locked(peers->shpool, peer_size);
+    } else {
+        peer = ngx_pcalloc(uscf->servers->pool, peer_size);
+    }
+#else
+    peer = ngx_pcalloc(uscf->servers->pool, peer_size);
+#endif
+    if (peer == NULL) {
+        lua_pushboolean(L, 0);
+        lua_pushliteral(L, "cannot allocate memory for a new peer");
+        return 2;
+    }
+
+    n = 0;
+    for (i = 0; i < u.naddrs; i++) {
+        peer[n].sockaddr = u.addrs[i].sockaddr;
+        peer[n].socklen = u.addrs[i].socklen;
+        peer[n].name = u.addrs[i].name;
+        peer[n].weight = weight;
+        peer[n].effective_weight = weight;
+        peer[n].current_weight = 0;
+        peer[n].max_fails = max_fails;
+        peer[n].fail_timeout = fail_timeout;
+        peer[n].down = down;
+        peer[n].server = u.url;
+
+        *peerp = &peer[n];
+        peerp = &peer[n].next;
+        peers->number = peers->number + 1;
+        n++;
+    }
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
 
 static ngx_http_upstream_rr_peer_t *
 ngx_http_lua_upstream_lookup_peer(lua_State *L)
 {
-    int                                   id, backup;
+    int                                   id, i, backup;
     ngx_str_t                             host;
     ngx_http_upstream_srv_conf_t         *us;
     ngx_http_upstream_rr_peers_t         *peers;
+    ngx_http_upstream_rr_peer_t          *peer;
 
     host.data = (u_char *) luaL_checklstring(L, 1, &host.len);
 
@@ -381,7 +626,16 @@ ngx_http_lua_upstream_lookup_peer(lua_State *L)
         return NULL;
     }
 
-    return &peers->peer[id];
+
+    for (peer = peers->peer, i = 0; i <= id; peer = peer->next, i++) {
+        if (id == i) {
+            return peer;
+        }
+    }
+
+    lua_pushnil(L);
+    lua_pushliteral(L, "failed to lookup a peer");
+    return NULL;
 }
 
 
